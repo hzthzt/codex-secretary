@@ -11,14 +11,14 @@ description: >-
 
 # Codex Secretary (Desktop Soft-Takeover & ACP Bridge Workflow)
 
-Use this skill to act as the user's **secretary and supervisor** while delegating heavy or long-running engineering work to local **OpenAI Codex** — either via **Codex Desktop Soft-Takeover** (default, live sidebar visibility) or via **`@agentclientprotocol/codex-acp`** (full ACP control with mid-turn `steer` / `cancel`).
+Use this skill to act as the user's **secretary and supervisor** while delegating heavy or long-running engineering work to local **OpenAI Codex** — either via **Codex Desktop Soft-Takeover** (default, live sidebar visibility + mid-turn `app steer`) or via **`@agentclientprotocol/codex-acp`** (full ACP control with instant `steer`, hard `cancel`, and auto-approval).
 
 ## Role Division
 
 - **Antigravity (Secretary)**:
   - Align requirements and acceptance criteria with the user before dispatching.
   - Translate user intent into clear, scoped engineering briefs for Codex.
-  - Supervise long runs: watch progress checkpoints, catch drift or tool errors early, inject mid-turn course corrections (`steer` in ACP mode), or gracefully abort (`cancel` in ACP mode).
+  - Supervise long runs: watch progress checkpoints, catch drift or tool errors early, inject mid-turn course corrections (`app steer` in Mode A or `steer` in Mode B), or gracefully hard-abort (`cancel` in Mode B; soft-stop via `app steer` in Mode A).
   - Synthesize Codex's reports, test results, and summaries into a concise executive update for the user.
 - **Codex (Heavy Programming Deputy)**:
   - Owns **all** source code reading, codebase exploration, multi-file edits, builds, tests, and code-level verification.
@@ -52,10 +52,10 @@ Optional environment variables:
 
 ### Execution Modes & Defaults
 
-| Mode | Commands | Instant Sidebar Visibility | Mid-turn `steer` / `cancel` / Auto-Approve | Default Rule |
-| :--- | :--- | :---: | :---: | :--- |
-| **Mode A: Desktop App Soft-Takeover** (Cache-aware Butler + `codex queue` + Read-Only SQLite Watch) | `app new` / `app send` / `app ask` / `app watch` / `app status` / `app read` / `app delete` / `app refresh` | **Yes (live UI)** | No (queue only; Desktop App handles UI permissions) | **DEFAULT for all new tasks** inside a registered Codex Desktop project. |
-| **Mode B: ACP Full-Control + Sidebar Refresh** (`codex-acp` Daemon + `app refresh`) | `new` → `send`/`ask` → `app refresh` → `watch` / `steer` / `cancel` | **Yes** (via `app refresh`) | **Yes (full ACP control)** | Use when user explicitly requests ACP, needs mid-turn `steer`/`cancel`/auto-approve, or workspace is not a registered Codex Desktop project. **When using ACP `new`, default to calling `app refresh` right after dispatching the first message so the sidebar updates immediately.** |
+| Mode | Commands | Instant Sidebar Visibility | Mid-Turn Steer / Soft-Stop | Hard `cancel` / Auto-Approve | Default Rule |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Mode A: Desktop App Soft-Takeover** (Cache-aware Butler + `codex queue` + `send_message_to_thread` Steer + Read-Only SQLite Watch) | `app new` / `app steer` / `app send` / `app ask` / `app watch` / `app status` / `app read` / `app delete` / `app refresh` | **Yes (live UI)** | **Yes** (`app steer` via `mcp__codex_app__send_message_to_thread`, also supports per-turn `--model`/`--thinking`) | No (Desktop App handles UI permissions & hard Stop button) | **DEFAULT for all new tasks** inside a registered Codex Desktop project. |
+| **Mode B: ACP Full-Control + Sidebar Refresh** (`codex-acp` Daemon + `app refresh`) | `new` → `send`/`ask` → `app refresh` → `watch` / `steer` / `cancel` | **Yes** (via `app refresh`) | **Yes** (direct millisecond `steer`) | **Yes** (protocol-level `cancel` & auto-approve) | Use when user explicitly requests ACP, needs hard `cancel` (aborting a stuck command mid-execution) or unattended auto-approve, or workspace is not a registered Codex Desktop project. **When using ACP `new`, default to calling `app refresh` right after dispatching the first message so the sidebar updates immediately.** |
 
 > **Important**: `app ...` commands invoke the native `codex` binary directly (avoiding Windows `cmd.exe` newline truncation) and read SQLite WAL (`state_5.sqlite` + `thread_history_1.sqlite`) concurrently in read-only mode, so they do **not** require starting the ACP daemon. `app refresh` is a standalone command that can be run independently at any time.
 
@@ -68,7 +68,7 @@ Optional environment variables:
 1. In Codex Desktop App, add a dedicated empty folder as a project (e.g., `<YourButlerProject>`) so butler threads and `[sync]` refresh pings stay isolated from formal project sidebars.
 2. Create one new thread inside that project using a fast, low-cost model with `low` thinking effort, and send:
    ```text
-   你是「Codex 桌面端线程调度管家」：绝不读代码、绝不跑终端，只按用户每条消息里的具体指令调用 mcp__codex_app__create_thread 或 mcp__codex_app__delete_thread，并严格输出要求的一行 JSON。
+   你是「Codex 桌面端线程调度管家」：绝不读代码、绝不跑终端，只按用户每条消息里的具体指令调用 mcp__codex_app__create_thread、mcp__codex_app__send_message_to_thread 或 mcp__codex_app__delete_thread，并严格输出要求的一行 JSON。
    本条消息只是初始化，现在不要调用任何工具，直接回复 READY。
    ```
 3. Copy its thread ID (`codex://threads/<butlerThreadId>`) and register it once:
@@ -129,17 +129,27 @@ node "$BRIDGE" app status <sessionId>
 node "$BRIDGE" app read <sessionId> --tail 20
 ```
 
-### A4. Follow-Up Turns (Direct Queue — Zero Butler Tokens)
+### A4. Follow-Up Turns vs. Mid-Turn Steering (`app send` vs. `app steer`)
 
-For Turn 2+, send directly to `<sessionId>` (bypasses the butler completely):
+- **Follow-up turns when idle (Direct Queue — Zero Butler Tokens)**:
+  `app send` / `app ask` invoke native `codex queue` directly (bypasses the butler completely). Note that if a turn is still running, `codex queue` strictly queues the message to run as the **next** turn after the current turn finishes.
+  ```powershell
+  # Quick blocking turn (queue + watch)
+  "Follow-up instructions..." | node "$BRIDGE" app ask <sessionId> --stdin
 
-```powershell
-# Quick blocking turn (queue + watch)
-"Follow-up instructions..." | node "$BRIDGE" app ask <sessionId> --stdin
+  # Non-blocking dispatch (returns { sinceOrdinal, prevTurnCount }), then call app watch
+  "Follow-up instructions..." | node "$BRIDGE" app send <sessionId> --stdin
+  ```
+- **Mid-turn real-time steering, soft-stop, or per-turn model/thinking override (`app steer`)**:
+  Calls `mcp__codex_app__send_message_to_thread` via the cache-aware butler. When `<sessionId>` is currently running (`running: true`), Desktop App **injects the steering message directly into the active turn** so Codex immediately pivots or abandons remaining steps right after the current single tool call finishes (no waiting for the whole turn to finish). Also supports `--model <m>` and `--thinking <low|medium|high|xhigh>` overrides.
+  ```powershell
+  # Steer or soft-stop a running Desktop thread mid-turn
+  "Stop refactoring file A; skip remaining steps and summarize current status." | node "$BRIDGE" app steer <sessionId> --stdin
 
-# Non-blocking dispatch (returns { sinceOrdinal, prevTurnCount }), then call app watch
-"Follow-up instructions..." | node "$BRIDGE" app send <sessionId> --stdin
-```
+  # Optional per-turn model/thinking override
+  "Deeply audit the race condition." | node "$BRIDGE" app steer <sessionId> --model "<model>" --thinking high --stdin
+  ```
+  > **Hard cancel note**: Codex Desktop App has no public API to kill an in-flight shell command that is hung/blocked. For true hard cancellation (`session/cancel`), use Mode B (ACP) or click Stop in Codex Desktop App UI.
 
 ### A5. Standalone Sidebar Refresh & Thread Deletion
 

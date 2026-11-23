@@ -15,9 +15,10 @@
 - **Zero External Script Dependencies**: `scripts/codex-bridge.mjs` runs purely on Node.js built-ins (including `node:sqlite` for concurrent read-only WAL monitoring).
 - **Mode A — Desktop App Soft-Takeover (Default)**:
   - Creates new conversations **directly inside Codex Desktop App** via a lightweight **Butler Thread** (`mcp__codex_app__create_thread`), so new tasks appear **immediately in the sidebar** with live UI streaming — no app restart needed.
+  - **Mid-Turn Live Steering & Soft-Stop (`app steer`)**: Injects guidance directly into a **running** Desktop thread via `mcp__codex_app__send_message_to_thread` (same turn, immediately pivots or skips remaining steps after the active tool call finishes) — and also supports per-turn `--model` / `--thinking` overrides.
   - **30-Minute GPT Prompt-Cache TTL**: Reuses the active butler while prompt cache is hot (`< 30 min`), and automatically rotates to a fresh lightweight butler once expired (`>= 30 min`).
   - **Automatic Retired-Butler Cleanup**: Attempts zero-token `codex delete --force` first; any retired butler still locked by Desktop App is piggybacked into the next normal dispatch turn via `mcp__codex_app__delete_thread` (zero extra turns).
-  - **Zero-Butler-Token Follow-Ups & Read-Only Supervision**: Turn 2+ uses native `codex queue` directly (fixing Windows `cmd.exe` multiline truncation) and monitors `thread_history_1.sqlite` in read-only WAL mode without writer-lock conflicts.
+  - **Zero-Butler-Token Follow-Ups & Read-Only Supervision**: Idle Turn 2+ uses native `codex queue` directly (`app send` / `app ask`, fixing Windows `cmd.exe` multiline truncation) and monitors `thread_history_1.sqlite` in read-only WAL mode without writer-lock conflicts.
 - **Mode B — ACP Full-Control (`@agentclientprotocol/codex-acp`) + Sidebar Refresh**:
   - Persistent local named pipe / Unix socket daemon wrapping `codex-acp`.
   - Full control: non-blocking `send`, reactive `watch` with `--wake-on-error`, mid-turn `steer` (`_session/steering`), graceful `cancel`, dynamic mode switching, and automatic permission approval.
@@ -83,7 +84,7 @@ To enable **Mode A (instant sidebar visibility)** and **`app refresh`**:
    - Send this initialization prompt and wait for it to reply `READY`:
 
    ```text
-   你是「Codex 桌面端线程调度管家」：绝不读代码、绝不跑终端，只按用户每条消息里的具体指令调用 mcp__codex_app__create_thread 或 mcp__codex_app__delete_thread，并严格输出要求的一行 JSON。
+   你是「Codex 桌面端线程调度管家」：绝不读代码、绝不跑终端，只按用户每条消息里的具体指令调用 mcp__codex_app__create_thread、mcp__codex_app__send_message_to_thread 或 mcp__codex_app__delete_thread，并严格输出要求的一行 JSON。
    本条消息只是初始化，现在不要调用任何工具，直接回复 READY。
    ```
 
@@ -156,11 +157,11 @@ node "$BRIDGE" app butler rotate --cwd "<NewButlerProject>" --delete-old
 
 ### Mode Comparison & Quick Commands
 
-| Mode | Commands | Instant Sidebar | Live UI Stream | Mid-turn `steer` / `cancel` | Best For |
-| :--- | :--- | :---: | :---: | :---: | :--- |
-| **Mode A (Default): Desktop Soft-Takeover** | `app new` → `app watch` → `app send/ask` | Yes | Yes | No | Daily tasks you want visible & interactive live in Codex Desktop App |
-| **Mode B: ACP Full-Control + Sidebar Sync** | `new` → `send` → `app refresh` → `watch/steer/cancel` | Yes (`app refresh`) | No (ACP holds lock) | **Yes** | Heavy unattended refactors requiring mid-turn steering or auto-approval |
-| **Standalone Sidebar Refresh** | `app refresh` | Yes | — | — | Forcing Codex Desktop App to refresh its sidebar after any external CLI/ACP session |
+| Mode | Commands | Instant Sidebar | Live UI Stream | Mid-Turn `steer` / Soft-Stop | Hard `cancel` / Auto-Approve | Best For |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| **Mode A (Default): Desktop Soft-Takeover** | `app new` → `app watch` → `app steer` / `app send/ask` | Yes | Yes | **Yes** (`app steer`, also supports `--model`/`--thinking`) | No (Desktop UI handles approvals & Stop button) | Daily tasks you want visible, steerable & interactive live in Codex Desktop App |
+| **Mode B: ACP Full-Control + Sidebar Sync** | `new` → `send` → `app refresh` → `watch/steer/cancel` | Yes (`app refresh`) | No (ACP holds lock) | **Yes** (direct ms `steer`) | **Yes** (protocol `cancel` & auto-approve) | Heavy unattended refactors requiring hard cancellation or automatic approval |
+| **Standalone Sidebar Refresh** | `app refresh` | Yes | — | — | — | Forcing Codex Desktop App to refresh its sidebar after any external CLI/ACP session |
 
 #### Quick Examples (PowerShell)
 
@@ -170,6 +171,11 @@ node "$BRIDGE" app butler rotate --cwd "<NewButlerProject>" --delete-old
 # Mode A: Create a formal task directly in Codex Desktop App (auto-checks 30-min butler cache)
 "Implement feature X and run tests." | node "$BRIDGE" app new --cwd "MyProject" --title "Feature X" --stdin
 node "$BRIDGE" app watch <sessionId> --since 0 --prev-turns 0 --timeout 60 --wake-on-error
+
+# Mode A: Mid-turn live steer / soft-stop (injects into the active turn via send_message_to_thread)
+"Skip file A; focus only on file B and summarize." | node "$BRIDGE" app steer <sessionId> --stdin
+
+# Mode A: Idle follow-up turn (zero butler tokens via direct codex queue)
 "Add edge-case tests." | node "$BRIDGE" app ask <sessionId> --stdin
 
 # Standalone sidebar refresh (works anytime)
@@ -203,12 +209,13 @@ node "$BRIDGE" watch <sessionId> --since 0 --timeout 60 --wake-on-error
 
 - **模式 A：Codex Desktop 软接管模式（默认）**
   - **侧边栏实时可见 + APP 内看直播**：通过常驻轻量“调度管家线程”调用 `mcp__codex_app__create_thread` 在 Desktop App 内部创建正式对话，无需重启 APP 即可在侧边栏立刻看到并实时观看流式输出。
+  - **运行中实时纠偏 / 软终止（`app steer`）**：通过管家调用 `mcp__codex_app__send_message_to_thread`，将纠偏或停手指令**直接注入正在执行的当前轮次**（当前单步命令结束后立即转向或跳过剩余步骤，无需等待整轮结束），并支持按轮覆盖 `--model` / `--thinking`。
   - **30 分钟 GPT 缓存活跃判定**：代码自动根据 `thread_history_1.sqlite` 判断距上次使用时间——30 分钟内热缓存直接复用（省 Token、响应快）；超过 30 分钟自动轮换新开轻量管家，旧管家标记为 `retired`。
-  - **退役管家自动清理**：优先尝试 **0 Token** 的 `codex delete --force` 静默清理；若仍被 Desktop App 占着写锁，则在下次正常 `app new` / `app refresh` 同一轮中“搭便车”调用 `mcp__codex_app__delete_thread` 一并删掉（0 额外轮次）。
-  - **零管家开销续聊 + 并发只读监工**：第二轮起跳过管家，直接通过原生 `codex.exe queue` 发送消息（彻底解决 Windows `cmd.exe` 多行换行截断问题），并通过只读 SQLite WAL（`state_5.sqlite` + `thread_history_1.sqlite`）实时追踪命令、文件修改、报错与最终回复。
+  - **退役管家自动清理**：优先尝试 **0 Token** 的 `codex delete --force` 静默清理；若仍被 Desktop App 占着写锁，则在下次正常 `app new` / `app steer` / `app refresh` 同一轮中“搭便车”调用 `mcp__codex_app__delete_thread` 一并删掉（0 额外轮次）。
+  - **零管家开销续聊 + 并发只读监工**：空闲时第二轮起跳过管家，直接通过原生 `codex.exe queue` 发送消息（`app send` / `app ask`，彻底解决 Windows `cmd.exe` 多行换行截断问题），并通过只读 SQLite WAL（`state_5.sqlite` + `thread_history_1.sqlite`）实时追踪命令、文件修改、报错与最终回复。
 - **模式 B：ACP 全控模式（`codex-acp`）+ 侧边栏同步**
   - 通过本地命名管道 / Unix Socket 守护进程常驻 `@agentclientprotocol/codex-acp`。
-  - 支持非阻塞派单（`send`）、报错秒醒监工（`watch --wake-on-error`）、**中途不打断纠偏（`steer`）**、**优雅中止（`cancel`）**、动态切换权限模式与自动审批。
+  - 支持非阻塞派单（`send`）、报错秒醒监工（`watch --wake-on-error`）、**直连毫秒级纠偏（`steer`）**、**协议级硬终止（`cancel`，可强杀运行中卡死命令）**、动态切换权限模式与自动审批。
   - 新建 ACP 会话并发送首轮任务后，默认补跑一次独立的 `app refresh`，无需重启 Desktop App 即可把新会话刷进侧边栏。
 - **独立功能：一键低消耗刷新侧边栏（`app refresh`）**
   - 用轻量模型创建一个极小的 `[sync]` 临时线程并在同一轮立即删除，强制触发 Codex Desktop App 刷新对话列表，可随时单独调用。
@@ -263,7 +270,7 @@ node "$BRIDGE" --help
    - 发送下面这段初始化提示词，等待它回复 `READY`：
 
    ```text
-   你是「Codex 桌面端线程调度管家」：绝不读代码、绝不跑终端，只按用户每条消息里的具体指令调用 mcp__codex_app__create_thread 或 mcp__codex_app__delete_thread，并严格输出要求的一行 JSON。
+   你是「Codex 桌面端线程调度管家」：绝不读代码、绝不跑终端，只按用户每条消息里的具体指令调用 mcp__codex_app__create_thread、mcp__codex_app__send_message_to_thread 或 mcp__codex_app__delete_thread，并严格输出要求的一行 JSON。
    本条消息只是初始化，现在不要调用任何工具，直接回复 READY。
    ```
 
@@ -322,19 +329,22 @@ node "$BRIDGE" --help
 "请帮我调研模块 A 并给出修改方案。" | node "$BRIDGE" app new --cwd "MyProject" --title "模块A调研" --stdin
 node "$BRIDGE" app watch <sessionId> --since 0 --prev-turns 0 --timeout 60 --wake-on-error
 
-# 2. 跳过管家直接续聊（0 管家 Token）
+# 2. 模式 A 运行中实时纠偏 / 软终止（或单轮临时覆盖模型/思考强度）
+"先别改文件 A，跳过剩余步骤直接汇总当前进展。" | node "$BRIDGE" app steer <sessionId> --stdin
+
+# 3. 空闲时跳过管家直接续聊（0 管家 Token）
 "按方案实施并运行单元测试。" | node "$BRIDGE" app ask <sessionId> --stdin
 
-# 3. 独立刷新 Codex Desktop 侧边栏
+# 4. 独立刷新 Codex Desktop 侧边栏
 node "$BRIDGE" app refresh
 
-# 4. 管家管理（查看状态 / 历代记录 / 手动轮换 / 清理退役管家）
+# 5. 管家管理（查看状态 / 历代记录 / 手动轮换 / 清理退役管家）
 node "$BRIDGE" app butler status
 node "$BRIDGE" app butler list
 node "$BRIDGE" app butler rotate --cwd "MyButlerProject" --delete-old
 node "$BRIDGE" app butler prune
 
-# 5. 模式 B：ACP 全控模式（支持 steer 纠偏、cancel 取消与自动审批）
+# 6. 模式 B：ACP 全控模式（支持毫秒级 steer、硬终止 cancel 与自动审批）
 node "$BRIDGE" daemon status
 node "$BRIDGE" new
 "重型重构任务..." | node "$BRIDGE" send <sessionId> --stdin

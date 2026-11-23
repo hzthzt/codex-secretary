@@ -1509,7 +1509,7 @@ async function tryCliDeleteRetiredButlers(ids) {
 
 function buildButlerInitPrompt() {
   return [
-    "你是「Codex 桌面端线程调度管家」：绝不读代码、绝不跑终端，只按用户每条消息里的具体指令调用 mcp__codex_app__create_thread 或 mcp__codex_app__delete_thread，并严格输出要求的一行 JSON。",
+    "你是「Codex 桌面端线程调度管家」：绝不读代码、绝不跑终端，只按用户每条消息里的具体指令调用 mcp__codex_app__create_thread、mcp__codex_app__send_message_to_thread 或 mcp__codex_app__delete_thread，并严格输出要求的一行 JSON。",
     "本条消息只是初始化，现在不要调用任何工具，直接回复 READY。",
   ].join("\n");
 }
@@ -1705,6 +1705,32 @@ function extractDeletedThreadsFromItems(items) {
   return deleted;
 }
 
+function extractSentMessagesFromItems(items) {
+  const sent = [];
+  for (const it of items) {
+    if (
+      it.type !== "mcpToolCall" ||
+      it.tool !== "send_message_to_thread" ||
+      it.status !== "completed" ||
+      it.error != null
+    ) {
+      continue;
+    }
+    const text = it.result?.content?.[0]?.text;
+    const parsed = safeJsonParse(text);
+    const tid = parsed?.threadId || it.arguments?.threadId;
+    if (tid) {
+      sent.push({
+        threadId: tid,
+        model: it.arguments?.model || null,
+        thinking: it.arguments?.thinking || null,
+        durationMs: it.durationMs ?? null,
+      });
+    }
+  }
+  return sent;
+}
+
 function extractCompactJsonFromReply(reply) {
   if (typeof reply !== "string" || !reply.trim()) return null;
   const trimmed = reply.trim();
@@ -1823,6 +1849,7 @@ async function dispatchButlerTurn(butler, message, timeoutSec = 45) {
     watch: watchRes,
     createdThreads: extractCreatedThreadsFromItems(watchRes.items || []),
     deletedThreads: extractDeletedThreadsFromItems(watchRes.items || []),
+    sentMessages: extractSentMessagesFromItems(watchRes.items || []),
     parsedJson: extractCompactJsonFromReply(watchRes.lastReply),
   };
 }
@@ -2252,6 +2279,100 @@ async function handleAppCommand(positional, flags, callerCwd) {
     };
   }
 
+  if (sub === "steer") {
+    const sessionId = positional[1];
+    if (!sessionId) {
+      throw new Error(
+        "Usage: codex-bridge.mjs app steer <sessionId> [--model <m>] [--thinking <level>] (--text ... | --stdin)"
+      );
+    }
+    const prompt = await readTextInput(flags);
+    const before = await getAppThreadSnapshot(sessionId, { sinceOrdinal: 0 });
+    if (!before.meta && before.turnCount === 0) {
+      throw new Error(`Codex thread not found: ${sessionId}`);
+    }
+
+    let activeButler = requireButlerConfig();
+    if (activeButler.threadId === sessionId) {
+      throw new Error("Cannot steer the active butler thread via itself; use `app send` or rotate butler first.");
+    }
+
+    const cacheBefore = await inspectButlerCacheState(activeButler);
+    const shouldRotate = flags["no-rotate"] ? false : Boolean(flags.rotate || cacheBefore.expired);
+    let rotatedFrom = null;
+
+    if (shouldRotate) {
+      const rot = await rotateButler({
+        model: flags["butler-model"],
+        thinking: flags["butler-thinking"],
+        deleteOldNow: false,
+        timeoutSec: flags.timeout ? Number(flags.timeout) : 45,
+      });
+      activeButler = rot.newButler;
+      rotatedFrom = rot.oldButlerId;
+    }
+
+    const skipAutoPrune = Boolean(flags["keep-retired"]);
+    const retiredBefore = skipAutoPrune ? [] : getRetiredButlerIds(readButlerConfig(), activeButler.threadId);
+    const { cliDeleted, stillLocked } = retiredBefore.length > 0
+      ? await tryCliDeleteRetiredButlers(retiredBefore)
+      : { cliDeleted: [], stillLocked: [] };
+
+    const sendArgs = {
+      threadId: sessionId,
+      prompt,
+    };
+    if (flags.model) sendArgs.model = flags.model;
+    if (flags.thinking) sendArgs.thinking = flags.thinking;
+
+    const delHint =
+      stillLocked.length > 0
+        ? `并在同一轮依次调用 mcp__codex_app__delete_thread（hostId="local", source="codex"）删除以下已退役旧管家：${JSON.stringify(stillLocked)}`
+        : "不要调用其他工具";
+
+    const turnRes = await dispatchButlerTurn(
+      activeButler,
+      `[STEER] 请原样使用下面 JSON 作为全部参数调用 mcp__codex_app__send_message_to_thread（必须保留 threadId、prompt 及所有给出的字段，绝不改写 prompt），${delHint}。完成后只输出一行 JSON {"ok":true,"thread_id":${JSON.stringify(sessionId)},"deleted_ids":${JSON.stringify(stillLocked)}}：\n${JSON.stringify(sendArgs)}`,
+      flags.timeout ? Number(flags.timeout) : 45
+    );
+
+    const sentMatch = turnRes.sentMessages.find((s) => s.threadId === sessionId) || turnRes.sentMessages[0] || null;
+    if (!sentMatch) {
+      throw new Error(
+        `Butler failed to steer thread ${sessionId} via send_message_to_thread (reason=${turnRes.watch.reason}, reply=${turnRes.watch.lastReply || ""})`
+      );
+    }
+
+    const mcpDeletedRetired = [];
+    for (const d of turnRes.deletedThreads) {
+      if (d.deleted && stillLocked.includes(d.threadId)) {
+        markButlerHistoryDeleted(d.threadId);
+        mcpDeletedRetired.push(d.threadId);
+      }
+    }
+
+    return {
+      ok: true,
+      mode: "desktop-soft-takeover",
+      method: "mcp_send_message_to_thread",
+      sessionId,
+      wasRunningBefore: before.running,
+      sinceOrdinal: before.latestOrdinal,
+      prevTurnCount: before.turnCount,
+      model: sentMatch.model || flags.model || null,
+      thinking: sentMatch.thinking || flags.thinking || null,
+      butlerThreadId: activeButler.threadId,
+      butlerCacheBefore: cacheBefore,
+      rotatedFrom,
+      retiredCleaned: {
+        cliZeroToken: cliDeleted,
+        piggybackMcp: mcpDeletedRetired,
+      },
+      mcpCallDurationMs: sentMatch.durationMs,
+      butlerDurationMs: turnRes.watch.turn?.duration_ms ?? null,
+    };
+  }
+
   if (sub === "send") {
     const sessionId = positional[1];
     if (!sessionId) throw new Error("Usage: codex-bridge.mjs app send <sessionId> (--text ... | --stdin)");
@@ -2361,7 +2482,7 @@ async function handleAppCommand(positional, flags, callerCwd) {
   }
 
   throw new Error(
-    `Unknown app subcommand: ${sub} (expected butler | new | send | ask | watch | status | read | delete | refresh)`
+    `Unknown app subcommand: ${sub} (expected butler | new | steer | send | ask | watch | status | read | delete | refresh)`
   );
 }
 
@@ -2391,6 +2512,7 @@ Usage (ACP Full-Control Mode):
 Usage (Desktop App Soft-Takeover Mode — Instant Sidebar Visibility):
   node codex-bridge.mjs app butler [status | list | set <threadId> [--cwd <project>] | rotate [--delete-old] | prune [threadId] [--cli-only]]
   node codex-bridge.mjs app new [--cwd <dir-or-project>] [--title "..."] [--model <m>] [--thinking <low|medium|high>] [--rotate | --no-rotate] [--keep-retired] (--text "..." | --stdin)
+  node codex-bridge.mjs app steer <sessionId> [--model <m>] [--thinking <low|medium|high|xhigh>] [--rotate | --no-rotate] [--keep-retired] (--text "..." | --text-file <file> | --stdin)
   node codex-bridge.mjs app send <sessionId> (--text "..." | --text-file <file> | --stdin) [--cwd <dir-or-project>]
   node codex-bridge.mjs app ask <sessionId> (--text "..." | --text-file <file> | --stdin) [--cwd <dir-or-project>] [--timeout <sec>]
   node codex-bridge.mjs app watch <sessionId> [--since <ordinal>] [--prev-turns <n>] [--timeout <sec>] [--wake-on-error]
