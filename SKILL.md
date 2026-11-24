@@ -46,7 +46,7 @@ Optional environment variables:
 - `CODEX_ACP_ENTRY`: Explicit path to `@agentclientprotocol/codex-acp/dist/index.js` (auto-detected by default).
 - `CODEX_BRIDGE_BUTLER_MODEL`: Optional default lightweight model for butler threads (if unset, inherits the model of your registered butler thread in `butler.json`).
 - `CODEX_BRIDGE_BUTLER_THINKING`: Butler reasoning effort (default: `low`).
-- `CODEX_BRIDGE_BUTLER_TTL_MIN`: Prompt-cache active window in minutes before auto-rotating the butler (default: `30`).
+- `CODEX_BRIDGE_BUTLER_MAX_CONTEXT_TOKENS`: Context-token threshold before auto-rotating the butler to a fresh thread (default: `75000`; set `0` to disable auto-rotation).
 - `CODEX_BRIDGE_DEFAULT_MODEL`: Optional default model for newly created formal task threads (`app new`; overridden by `--model`, or stored in `butler.json` as `defaultTaskModel` via `app butler set ... --default-model <model>`).
 - `CODEX_BRIDGE_DEFAULT_THINKING`: Optional default reasoning effort for newly created formal task threads (`app new`; overridden by `--thinking`, or stored in `butler.json` as `defaultTaskThinking` via `app butler set ... --default-thinking <level>`).
 
@@ -77,13 +77,13 @@ Optional environment variables:
    ```
    This saves `~/.gemini/codex-bridge/butler.json` (auto-inheriting that thread's model and thinking effort).
 
-### A1. Butler Lifecycle (30-Minute GPT Cache TTL & Auto-Cleanup)
+### A1. Butler Lifecycle (75k Context-Based Rotation & Auto-Cleanup)
 
 All butler threads ever created are tracked in `~/.gemini/codex-bridge/butler.json` (`history` array with `active` / `retired` / `deleted` status).
 
-- **Active window (30-minute GPT Prompt Cache TTL)**:
-  - **< 30 min since last turn (`cacheHot: true`)**: Prompt cache is still hot — `app new` and `app refresh` **reuse** the active butler directly for minimum cost & latency.
-  - **≥ 30 min since last turn (`expired: true`)**: Cache has expired — `app new` / `app refresh` **automatically rotates** to a fresh lightweight butler (inheriting the configured butler model & `low` thinking) and marks the old one `retired`.
+- **Context-based auto-rotation (default `75000` tokens, no time TTL)**:
+  - **< 75k context tokens (`needsRotate: false`)**: `app new`, `app steer`, and `app refresh` **reuse** the active butler directly regardless of idle duration.
+  - **≥ 75k context tokens (`needsRotate: true`)**: `app new` / `app steer` / `app refresh` **automatically rotates** to a fresh lightweight butler (inheriting the configured butler model & `low` thinking) and marks the old one `retired`.
 - **Automatic cleanup of retired butlers**:
   - On `app new` / `app refresh` / `app butler prune`, `codex-bridge.mjs` first attempts **zero-token** `codex delete --force` (succeeds whenever Desktop App is not holding the thread's writer lock).
   - Any retired butler still locked by Desktop App is **piggybacked** (`mcp__codex_app__delete_thread`) into the active butler's next normal `[DISPATCH]` / `[REFRESH]` turn (zero extra turns) or batch-deleted in a single turn via `app butler prune`.

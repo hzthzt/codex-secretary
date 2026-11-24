@@ -40,7 +40,11 @@ const DEFAULT_MODE = process.env.CODEX_BRIDGE_DEFAULT_MODE || "agent-full-access
 const DEFAULT_APPROVAL = process.env.CODEX_BRIDGE_APPROVAL || "auto"; // auto | manual
 const DEFAULT_BUTLER_MODEL = process.env.CODEX_BRIDGE_BUTLER_MODEL || null;
 const DEFAULT_BUTLER_THINKING = process.env.CODEX_BRIDGE_BUTLER_THINKING || "low";
-const DEFAULT_BUTLER_TTL_MIN = Number(process.env.CODEX_BRIDGE_BUTLER_TTL_MIN || 30);
+const DEFAULT_BUTLER_MAX_CONTEXT_TOKENS =
+  process.env.CODEX_BRIDGE_BUTLER_MAX_CONTEXT_TOKENS !== undefined &&
+  process.env.CODEX_BRIDGE_BUTLER_MAX_CONTEXT_TOKENS !== ""
+    ? Number(process.env.CODEX_BRIDGE_BUTLER_MAX_CONTEXT_TOKENS)
+    : 75000;
 const DEFAULT_TASK_MODEL = process.env.CODEX_BRIDGE_DEFAULT_MODEL || null;
 const DEFAULT_TASK_THINKING = process.env.CODEX_BRIDGE_DEFAULT_THINKING || null;
 
@@ -1455,16 +1459,59 @@ function touchButlerLastUsed(threadId) {
   fs.writeFileSync(BUTLER_CONFIG_PATH, JSON.stringify({ ...cfg, updatedAt: now }, null, 2) + "\n", "utf8");
 }
 
+function readLatestContextTokensFromRollout(rolloutPath) {
+  if (!rolloutPath) return null;
+  const cleanPath = String(rolloutPath).replace(/^\\\\\?\\/, "");
+  if (!fs.existsSync(cleanPath)) return null;
+  try {
+    const stat = fs.statSync(cleanPath);
+    const readSize = Math.min(stat.size, 256 * 1024);
+    const fd = fs.openSync(cleanPath, "r");
+    const buf = Buffer.alloc(readSize);
+    try {
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
+    } finally {
+      fs.closeSync(fd);
+    }
+    const lines = buf.toString("utf8").split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i].trim();
+      if (!line || (!line.includes("last_token_usage") && !line.includes("token_usage_record"))) continue;
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (obj?.type === "event_msg" && obj?.payload?.type === "token_count") {
+        const u = obj.payload?.info?.last_token_usage;
+        const val = Number(u?.total_tokens ?? u?.input_tokens);
+        if (Number.isFinite(val) && val > 0) return val;
+      }
+      if (obj?.type === "token_usage_record") {
+        const u = obj.payload?.usage;
+        const val = Number(u?.total_tokens ?? u?.input_tokens);
+        if (Number.isFinite(val) && val > 0) return val;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 async function inspectButlerCacheState(cfg) {
-  const ttlMin = DEFAULT_BUTLER_TTL_MIN;
-  const ttlMs = ttlMin * 60 * 1000;
+  const maxContextTokens =
+    Number.isFinite(DEFAULT_BUTLER_MAX_CONTEXT_TOKENS) && DEFAULT_BUTLER_MAX_CONTEXT_TOKENS > 0
+      ? DEFAULT_BUTLER_MAX_CONTEXT_TOKENS
+      : null;
   let lastUsedMs = null;
+  let contextTokens = null;
 
   try {
     const snap = await getAppThreadSnapshot(cfg.threadId, { tail: 1 });
     const lt = snap.latestTurn;
     const turnSec = lt?.completed_at || lt?.started_at || null;
     if (turnSec) lastUsedMs = Number(turnSec) * 1000;
+    contextTokens = readLatestContextTokensFromRollout(snap.meta?.rollout_path);
   } catch {}
 
   if (!lastUsedMs) {
@@ -1476,13 +1523,18 @@ async function inspectButlerCacheState(cfg) {
   }
 
   const ageMs = lastUsedMs ? Math.max(0, Date.now() - lastUsedMs) : Infinity;
-  const expired = ageMs >= ttlMs;
+  const needsRotate = Boolean(maxContextTokens && contextTokens !== null && contextTokens >= maxContextTokens);
   return {
-    ttlMinutes: ttlMin,
+    rotationPolicy: "context_tokens",
+    maxContextTokens,
+    contextTokens,
+    contextPercent:
+      maxContextTokens && contextTokens !== null ? Math.round((contextTokens / maxContextTokens) * 1000) / 10 : null,
     lastUsedAt: lastUsedMs ? new Date(lastUsedMs).toISOString() : null,
     ageMinutes: Number.isFinite(ageMs) ? Math.round((ageMs / 60000) * 10) / 10 : null,
-    cacheHot: !expired,
-    expired,
+    needsRotate,
+    cacheHot: !needsRotate,
+    expired: needsRotate,
   };
 }
 
