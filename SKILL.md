@@ -49,6 +49,7 @@ Optional environment variables:
 - `CODEX_BRIDGE_BUTLER_MAX_CONTEXT_TOKENS`: Context-token threshold before auto-rotating the butler to a fresh thread (default: `75000`; set `0` to disable auto-rotation).
 - `CODEX_BRIDGE_DEFAULT_MODEL`: Optional default model for newly created formal task threads (`app new`; overridden by `--model`, or stored in `butler.json` as `defaultTaskModel` via `app butler set ... --default-model <model>`).
 - `CODEX_BRIDGE_DEFAULT_THINKING`: Optional default reasoning effort for newly created formal task threads (`app new`; overridden by `--thinking`, or stored in `butler.json` as `defaultTaskThinking` via `app butler set ... --default-thinking <level>`).
+- `CODEX_BRIDGE_APP_POLL_MS`: Optional default poll interval in milliseconds for `app watch` / `app ask` (default: `1500`; overridden per call with `--poll-ms <ms>`).
 
 ### Execution Modes & Defaults
 

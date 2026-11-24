@@ -47,6 +47,10 @@ const DEFAULT_BUTLER_MAX_CONTEXT_TOKENS =
     : 75000;
 const DEFAULT_TASK_MODEL = process.env.CODEX_BRIDGE_DEFAULT_MODEL || null;
 const DEFAULT_TASK_THINKING = process.env.CODEX_BRIDGE_DEFAULT_THINKING || null;
+const DEFAULT_APP_POLL_MS = (() => {
+  const v = Number(process.env.CODEX_BRIDGE_APP_POLL_MS);
+  return Number.isFinite(v) && v >= 100 ? Math.floor(v) : 1500;
+})();
 
 function resolveCodexAcpEntry() {
   if (process.env.CODEX_ACP_ENTRY && fs.existsSync(process.env.CODEX_ACP_ENTRY)) {
@@ -1657,8 +1661,8 @@ async function getAppThreadMeta(threadId) {
   });
 }
 
-async function getAppThreadSnapshot(threadId, { sinceOrdinal = 0, tail = 0 } = {}) {
-  const meta = await getAppThreadMeta(threadId);
+async function getAppThreadSnapshot(threadId, { sinceOrdinal = 0, tail = 0, includeMeta = true } = {}) {
+  const meta = includeMeta ? await getAppThreadMeta(threadId) : null;
   const hist = await withReadOnlyDb(CODEX_HISTORY_DB, (db) => {
     const turns = db
       .prepare(
@@ -1796,6 +1800,83 @@ function extractCompactJsonFromReply(reply) {
   return null;
 }
 
+function getSqliteFileSignature(dbPath) {
+  const parts = [];
+  for (const suffix of ["", "-wal"]) {
+    const p = dbPath + suffix;
+    try {
+      const st = fs.statSync(p);
+      parts.push(`${st.size}:${st.mtimeMs}`);
+    } catch {
+      parts.push("missing");
+    }
+  }
+  return parts.join("|");
+}
+
+async function getAppLastAgentReply(threadId) {
+  return withReadOnlyDb(CODEX_HISTORY_DB, (db) => {
+    const row = db
+      .prepare(
+        "SELECT item_json FROM thread_items WHERE thread_id = ? AND item_type = 'agentMessage' ORDER BY rollout_ordinal DESC LIMIT 1"
+      )
+      .get(threadId);
+    const parsed = row ? safeJsonParse(row.item_json) : null;
+    return parsed?.text || null;
+  });
+}
+
+async function pollAppThreadIncremental(threadId, { sinceOrdinal = 0, updatedCursor = 0, initialFetch = true } = {}) {
+  return withReadOnlyDb(CODEX_HISTORY_DB, (db) => {
+    const turns = db
+      .prepare(
+        "SELECT turn_id, rollout_ordinal, status, error_json, started_at, completed_at, duration_ms FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal ASC"
+      )
+      .all(threadId)
+      .map((r) => ({ ...r }));
+
+    const ordRow = db
+      .prepare(
+        "SELECT COALESCE(MAX(rollout_ordinal), 0) AS m, COALESCE(MAX(updated_at_ordinal), 0) AS u FROM thread_items WHERE thread_id = ?"
+      )
+      .get(threadId);
+    const latestOrdinal = Number(ordRow?.m || 0);
+    const latestUpdatedOrdinal = Number(ordRow?.u || 0);
+
+    let deltaItems = [];
+    if (initialFetch) {
+      if (latestOrdinal > sinceOrdinal) {
+        const rows = db
+          .prepare(
+            "SELECT thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, completed_at_ms, item_type, item_json FROM thread_items WHERE thread_id = ? AND rollout_ordinal > ? ORDER BY rollout_ordinal ASC"
+          )
+          .all(threadId, sinceOrdinal);
+        deltaItems = rows.map(summarizeAppItem);
+      }
+    } else if (latestUpdatedOrdinal > updatedCursor && latestOrdinal > sinceOrdinal) {
+      const rows = db
+        .prepare(
+          "SELECT thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, completed_at_ms, item_type, item_json FROM thread_items WHERE thread_id = ? AND updated_at_ordinal > ? AND rollout_ordinal > ? ORDER BY rollout_ordinal ASC"
+        )
+        .all(threadId, updatedCursor, sinceOrdinal);
+      deltaItems = rows.map(summarizeAppItem);
+    }
+
+    const latestTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+    const running = Boolean(latestTurn && latestTurn.status === "inProgress");
+
+    return {
+      turns,
+      turnCount: turns.length,
+      latestTurn,
+      running,
+      latestOrdinal,
+      latestUpdatedOrdinal,
+      deltaItems,
+    };
+  });
+}
+
 async function watchAppThread(
   threadId,
   {
@@ -1803,87 +1884,144 @@ async function watchAppThread(
     prevTurnCount = null,
     timeoutSec = 60,
     wakeOnError = false,
-    pollMs = 400,
+    pollMs = DEFAULT_APP_POLL_MS,
   } = {}
 ) {
+  const safePollMs =
+    Number.isFinite(Number(pollMs)) && Number(pollMs) >= 100
+      ? Math.floor(Number(pollMs))
+      : DEFAULT_APP_POLL_MS;
+  const forceCheckMs = Math.min(Math.max(safePollMs * 2, 1000), 3000);
   const deadline = Date.now() + Number(timeoutSec || 60) * 1000;
-  let lastSnap = null;
 
-  while (true) {
-    lastSnap = await getAppThreadSnapshot(threadId, { sinceOrdinal });
-    const targetTurn =
-      prevTurnCount !== null && prevTurnCount !== undefined
-        ? lastSnap.turns[prevTurnCount] || null
-        : lastSnap.latestTurn;
+  const itemsByOrdinal = new Map();
+  let updatedCursor = 0;
+  let initialFetch = true;
+  let lastFileSig = null;
+  let lastDbCheckAt = 0;
+  let lastState = null;
 
-    const toolCalls = lastSnap.items.filter(
+  const summarizeCollected = () => {
+    const items = [...itemsByOrdinal.values()].sort((a, b) => a.ordinal - b.ordinal);
+    const toolCalls = items.filter(
       (i) => i.type === "commandExecution" || i.type === "fileChange" || i.type === "mcpToolCall"
     );
-    const agentMsgs = lastSnap.items.filter((i) => i.type === "agentMessage");
+    const agentMsgs = items.filter((i) => i.type === "agentMessage");
     const newReply = agentMsgs.length > 0 ? agentMsgs[agentMsgs.length - 1].text : undefined;
+    return { items, toolCalls, newReply };
+  };
 
-    if (targetTurn && targetTurn.status !== "inProgress") {
-      const isErr =
-        targetTurn.status === "failed" ||
-        targetTurn.status === "error" ||
-        Boolean(targetTurn.error_json);
-      const isCancelled = targetTurn.status === "interrupted" || targetTurn.status === "cancelled";
-      const reason = isErr ? "turn_error" : isCancelled ? "turn_cancelled" : "turn_completed";
-      return {
-        ok: !isErr,
-        reason,
-        sessionId: threadId,
-        turnCount: lastSnap.turnCount,
-        latestOrdinal: lastSnap.latestOrdinal,
-        running: false,
-        turn: targetTurn,
-        toolCallsSoFar: toolCalls,
-        lastReply: newReply !== undefined ? newReply : lastSnap.lastReply,
-        items: lastSnap.items,
-      };
-    }
+  while (true) {
+    const now = Date.now();
+    const fileSig = getSqliteFileSignature(CODEX_HISTORY_DB);
+    const shouldQueryDb =
+      initialFetch ||
+      fileSig !== lastFileSig ||
+      now - lastDbCheckAt >= forceCheckMs ||
+      now >= deadline;
 
-    if (wakeOnError) {
-      const errItem = lastSnap.items.find(isAppItemError);
-      if (errItem) {
+    if (shouldQueryDb) {
+      const state = await pollAppThreadIncremental(threadId, {
+        sinceOrdinal,
+        updatedCursor,
+        initialFetch,
+      });
+      lastState = state;
+      lastFileSig = fileSig;
+      lastDbCheckAt = Date.now();
+      initialFetch = false;
+
+      if (state.latestUpdatedOrdinal > updatedCursor) {
+        updatedCursor = state.latestUpdatedOrdinal;
+      }
+      for (const item of state.deltaItems) {
+        itemsByOrdinal.set(item.ordinal, item);
+      }
+
+      const targetTurn =
+        prevTurnCount !== null && prevTurnCount !== undefined
+          ? state.turns[prevTurnCount] || null
+          : state.latestTurn;
+
+      if (targetTurn && targetTurn.status !== "inProgress") {
+        const { items, toolCalls, newReply } = summarizeCollected();
+        const isErr =
+          targetTurn.status === "failed" ||
+          targetTurn.status === "error" ||
+          Boolean(targetTurn.error_json);
+        const isCancelled = targetTurn.status === "interrupted" || targetTurn.status === "cancelled";
+        const reason = isErr ? "turn_error" : isCancelled ? "turn_cancelled" : "turn_completed";
+        const lastReply = newReply !== undefined ? newReply : await getAppLastAgentReply(threadId);
         return {
-          ok: true,
-          reason: "tool_error",
+          ok: !isErr,
+          reason,
           sessionId: threadId,
-          turnCount: lastSnap.turnCount,
-          latestOrdinal: lastSnap.latestOrdinal,
-          running: lastSnap.running,
+          turnCount: state.turnCount,
+          latestOrdinal: state.latestOrdinal,
+          running: false,
           turn: targetTurn,
-          errorItem: errItem,
           toolCallsSoFar: toolCalls,
-          partialReply: newReply,
-          items: lastSnap.items,
+          lastReply,
+          items,
         };
+      }
+
+      if (wakeOnError && state.deltaItems.length > 0) {
+        const errItem = state.deltaItems.find(isAppItemError);
+        if (errItem) {
+          const { items, toolCalls, newReply } = summarizeCollected();
+          return {
+            ok: true,
+            reason: "tool_error",
+            sessionId: threadId,
+            turnCount: state.turnCount,
+            latestOrdinal: state.latestOrdinal,
+            running: state.running,
+            turn: targetTurn,
+            errorItem: errItem,
+            toolCallsSoFar: toolCalls,
+            partialReply: newReply,
+            items,
+          };
+        }
       }
     }
 
     if (Date.now() >= deadline) {
+      const targetTurn =
+        prevTurnCount !== null && prevTurnCount !== undefined
+          ? lastState.turns[prevTurnCount] || null
+          : lastState.latestTurn;
+      const { items, toolCalls, newReply } = summarizeCollected();
+      const lastReply = !lastState.running
+        ? newReply !== undefined
+          ? newReply
+          : await getAppLastAgentReply(threadId)
+        : undefined;
       return {
         ok: true,
         reason: "timeout",
         sessionId: threadId,
-        turnCount: lastSnap.turnCount,
-        latestOrdinal: lastSnap.latestOrdinal,
-        running: lastSnap.running,
+        turnCount: lastState.turnCount,
+        latestOrdinal: lastState.latestOrdinal,
+        running: lastState.running,
         turn: targetTurn,
         toolCallsSoFar: toolCalls,
         partialReply: newReply,
-        lastReply: !lastSnap.running ? lastSnap.lastReply : undefined,
-        items: lastSnap.items,
+        lastReply,
+        items,
       };
     }
 
-    await new Promise((r) => setTimeout(r, pollMs));
+    const remainingMs = deadline - Date.now();
+    if (remainingMs > 0) {
+      await new Promise((r) => setTimeout(r, Math.min(safePollMs, remainingMs)));
+    }
   }
 }
 
 async function dispatchButlerTurn(butler, message, timeoutSec = 45) {
-  const before = await getAppThreadSnapshot(butler.threadId, { sinceOrdinal: 0 });
+  const before = await getAppThreadSnapshot(butler.threadId, { tail: 1, includeMeta: false });
   const qRes = await runCodexQueueFallback(butler.threadId, message, butler.cwd);
   if (!qRes.ok) {
     throw new Error(`Failed to queue message to butler ${butler.threadId}: ${qRes.stderr || qRes.stdout}`);
@@ -1893,7 +2031,7 @@ async function dispatchButlerTurn(butler, message, timeoutSec = 45) {
     prevTurnCount: before.turnCount,
     timeoutSec,
     wakeOnError: false,
-    pollMs: 350,
+    pollMs: 400,
   });
   touchButlerLastUsed(butler.threadId);
   return {
@@ -2339,7 +2477,7 @@ async function handleAppCommand(positional, flags, callerCwd) {
       );
     }
     const prompt = await readTextInput(flags);
-    const before = await getAppThreadSnapshot(sessionId, { sinceOrdinal: 0 });
+    const before = await getAppThreadSnapshot(sessionId, { tail: 1 });
     if (!before.meta && before.turnCount === 0) {
       throw new Error(`Codex thread not found: ${sessionId}`);
     }
@@ -2429,7 +2567,7 @@ async function handleAppCommand(positional, flags, callerCwd) {
     const sessionId = positional[1];
     if (!sessionId) throw new Error("Usage: codex-bridge.mjs app send <sessionId> (--text ... | --stdin)");
     const text = await readTextInput(flags);
-    const before = await getAppThreadSnapshot(sessionId, { sinceOrdinal: 0 });
+    const before = await getAppThreadSnapshot(sessionId, { tail: 1 });
     const targetCwd =
       flags.cwd ||
       (before.meta?.cwd ? before.meta.cwd.replace(/^\\\\\?\\/, "") : callerCwd);
@@ -2445,12 +2583,13 @@ async function handleAppCommand(positional, flags, callerCwd) {
 
   if (sub === "watch") {
     const sessionId = positional[1];
-    if (!sessionId) throw new Error("Usage: codex-bridge.mjs app watch <sessionId> [--since <ord>] [--prev-turns <n>] [--timeout <sec>] [--wake-on-error]");
+    if (!sessionId) throw new Error("Usage: codex-bridge.mjs app watch <sessionId> [--since <ord>] [--prev-turns <n>] [--timeout <sec>] [--poll-ms <ms>] [--wake-on-error]");
     return watchAppThread(sessionId, {
       sinceOrdinal: flags.since !== undefined ? Number(flags.since) : 0,
       prevTurnCount: flags["prev-turns"] !== undefined ? Number(flags["prev-turns"]) : null,
       timeoutSec: flags.timeout ? Number(flags.timeout) : 60,
       wakeOnError: Boolean(flags["wake-on-error"]),
+      pollMs: flags["poll-ms"] ? Number(flags["poll-ms"]) : DEFAULT_APP_POLL_MS,
     });
   }
 
@@ -2458,7 +2597,7 @@ async function handleAppCommand(positional, flags, callerCwd) {
     const sessionId = positional[1];
     if (!sessionId) throw new Error("Usage: codex-bridge.mjs app ask <sessionId> (--text ... | --stdin)");
     const text = await readTextInput(flags);
-    const before = await getAppThreadSnapshot(sessionId, { sinceOrdinal: 0 });
+    const before = await getAppThreadSnapshot(sessionId, { tail: 1 });
     const targetCwd =
       flags.cwd ||
       (before.meta?.cwd ? before.meta.cwd.replace(/^\\\\\?\\/, "") : callerCwd);
@@ -2471,6 +2610,7 @@ async function handleAppCommand(positional, flags, callerCwd) {
       prevTurnCount: before.turnCount,
       timeoutSec: flags.timeout ? Number(flags.timeout) : 120,
       wakeOnError: Boolean(flags["wake-on-error"]),
+      pollMs: flags["poll-ms"] ? Number(flags["poll-ms"]) : DEFAULT_APP_POLL_MS,
     });
   }
 
@@ -2566,8 +2706,8 @@ Usage (Desktop App Soft-Takeover Mode — Instant Sidebar Visibility):
   node codex-bridge.mjs app new [--cwd <dir-or-project>] [--title "..."] [--model <m>] [--thinking <low|medium|high>] [--rotate | --no-rotate] [--keep-retired] (--text "..." | --stdin)
   node codex-bridge.mjs app steer <sessionId> [--model <m>] [--thinking <low|medium|high|xhigh>] [--rotate | --no-rotate] [--keep-retired] (--text "..." | --text-file <file> | --stdin)
   node codex-bridge.mjs app send <sessionId> (--text "..." | --text-file <file> | --stdin) [--cwd <dir-or-project>]
-  node codex-bridge.mjs app ask <sessionId> (--text "..." | --text-file <file> | --stdin) [--cwd <dir-or-project>] [--timeout <sec>]
-  node codex-bridge.mjs app watch <sessionId> [--since <ordinal>] [--prev-turns <n>] [--timeout <sec>] [--wake-on-error]
+  node codex-bridge.mjs app ask <sessionId> (--text "..." | --text-file <file> | --stdin) [--cwd <dir-or-project>] [--timeout <sec>] [--poll-ms <ms>]
+  node codex-bridge.mjs app watch <sessionId> [--since <ordinal>] [--prev-turns <n>] [--timeout <sec>] [--poll-ms <ms>] [--wake-on-error]
   node codex-bridge.mjs app status <sessionId> [--tail <n>]
   node codex-bridge.mjs app read <sessionId> [--since <ordinal> | --tail <n>]
   node codex-bridge.mjs app delete <sessionId> [--cli]
